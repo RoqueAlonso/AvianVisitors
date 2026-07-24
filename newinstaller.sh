@@ -43,7 +43,7 @@ if [[ ! -z $PACKAGES_MISSING ]] ; then
   sudo apt -y install $PACKAGES_MISSING
 fi
 
-branch=avian-visitors
+branch=iberia-illustrations
 git clone -b $branch --depth=1 https://github.com/RoqueAlonso/AvianVisitors.git ${HOME}/BirdNET-Pi &&
 
 $HOME/BirdNET-Pi/scripts/install_birdnet.sh
