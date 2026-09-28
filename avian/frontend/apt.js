@@ -2919,7 +2919,7 @@
       btn.style.top = r.y + 'px';
       btn.style.width = r.fullW + 'px';
       btn.style.height = r.fullH + 'px';
-      btn.innerHTML = '<img loading="lazy" decoding="async" src="' + img + '" alt="' + s.com + '">';
+      btn.innerHTML = '<img loading="lazy" decoding="async" src="' + img + '" alt="' + escHtml(s.com) + '">';
       if (r.labelRows) {
         addLabelInk();
         // One baseline per line of the name, each riding the line the planner
