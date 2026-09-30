@@ -363,8 +363,11 @@ configure_caddy_php() {
 }
 
 install_phpsysinfo() {
-  sudo -u ${USER} git clone https://github.com/phpsysinfo/phpsysinfo.git \
-    ${HOME}/phpsysinfo
+  if [ -d "${HOME}/phpsysinfo/.git" ]; then
+    return 0
+  fi
+  sudo -u "${USER}" git clone https://github.com/phpsysinfo/phpsysinfo.git \
+    "${HOME}/phpsysinfo"
 }
 
 config_icecast() {
@@ -401,16 +404,39 @@ EOF
   systemctl enable livestream.service
 }
 
+install_cron_template() {
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    # Keep operator schedules, while treating reboot cleanup as a separate job.
+    if ! awk -v wanted="$line" '
+      function identity(line, fields, user_field) {
+        sub(/^[[:space:]]*#[[:space:]]*/, "", line)
+        split(line, fields)
+        user_field = fields[1] ~ /^@/ ? 2 : 6
+        return (fields[1] == "@reboot") SUBSEP fields[user_field] SUBSEP fields[user_field + 1]
+      }
+      /^#birdnet$/ { marked=1; next }
+      marked && identity($0) == identity(wanted) { found=1 }
+      { marked=0 }
+      END { exit !found }
+    ' /etc/crontab; then
+      # uninstall.sh removes each marker together with the following job.
+      printf '#birdnet\n%s\n' "$line" >> /etc/crontab
+    fi
+  done < <(sed "s/\$USER/$USER/g" "$1")
+}
+
 install_cleanup_cron() {
-  sed "s/\$USER/$USER/g" $my_dir/templates/cleanup.cron >> /etc/crontab
+  install_cron_template "$my_dir/templates/cleanup.cron"
 }
 
 install_weekly_cron() {
-  sed "s/\$USER/$USER/g" $my_dir/templates/weekly_report.cron >> /etc/crontab
+  install_cron_template "$my_dir/templates/weekly_report.cron"
 }
 
 install_automatic_update_cron() {
-  sed "s/\$USER/$USER/g" $my_dir/templates/automatic_update.cron >> /etc/crontab
+  install_cron_template "$my_dir/templates/automatic_update.cron"
 }
 
 chown_things() {
@@ -418,8 +444,8 @@ chown_things() {
 }
 
 increase_caddy_timeout() {
-  mkdir /etc/systemd/system/caddy.service.d
-  cat << EOF > /etc/systemd/system/caddy.service.d/override.conf
+  mkdir -p /etc/systemd/system/caddy.service.d
+  cat << EOF > /etc/systemd/system/caddy.service.d/10-avian-timeout.conf
 [Service]
 TimeoutSec=300s
 EOF
