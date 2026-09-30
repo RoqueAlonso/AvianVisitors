@@ -115,10 +115,7 @@ function restore_file(string $path, bool $existed, string $contents): bool {
 }
 
 function find_executable(string $name): ?string {
-    // PHP-FPM pools default to clear_env = yes, and the stock www.conf ships
-    // env[PATH] commented out, so getenv('PATH') is empty under FPM. Without
-    // a fallback nohup is never found and the caller reports "generator
-    // unavailable", which points nowhere useful.
+    // PHP-FPM clears PATH unless the pool explicitly supplies it.
     $path = (string)getenv('PATH');
     $directories = $path !== ''
         ? explode(PATH_SEPARATOR, $path)

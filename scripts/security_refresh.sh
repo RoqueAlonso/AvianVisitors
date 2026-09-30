@@ -93,6 +93,38 @@ if [ ! -f "$generation_lock" ] || [ -L "$generation_lock" ] \
   exit 1
 fi
 
+# /run is cleared at boot. Keep the policy root-owned and preserve the live
+# lock inode when refreshing an existing installation.
+tmpfiles_dir=/etc/tmpfiles.d
+generation_policy=$tmpfiles_dir/avian-generation.conf
+if [ ! -e "$tmpfiles_dir" ] && [ ! -L "$tmpfiles_dir" ]; then
+  install -d -o root -g root -m 0755 "$tmpfiles_dir"
+fi
+[ -d "$tmpfiles_dir" ] && [ ! -L "$tmpfiles_dir" ] \
+  && [ "$(stat -c '%u:%g:%a' -- "$tmpfiles_dir")" = '0:0:755' ] \
+  || { echo "Unsafe tmpfiles directory" >&2; exit 1; }
+if [ -e "$generation_policy" ] || [ -L "$generation_policy" ]; then
+  [ -f "$generation_policy" ] && [ ! -L "$generation_policy" ] \
+    && [ "$(stat -c '%u:%g:%a:%h' -- "$generation_policy")" = '0:0:644:1' ] \
+    || { echo "Unsafe generation tmpfiles policy" >&2; exit 1; }
+fi
+generation_policy_temp=$(mktemp "$tmpfiles_dir/.avian-generation.XXXXXX")
+# Create-only metadata must not chmod/chown a preexisting hard-linked inode.
+printf 'f /run/lock/avian-generation.lock :0660 :root :%s -\n' "$birdnet_gid" \
+  >"$generation_policy_temp"
+chmod 0644 "$generation_policy_temp"
+mv -fT -- "$generation_policy_temp" "$generation_policy"
+
+# SQLite needs a writable directory for its journal, not writable PHP code.
+image_cache_dir=$auth_state_dir/image-cache
+if [ -e "$image_cache_dir" ] || [ -L "$image_cache_dir" ]; then
+  [ -d "$image_cache_dir" ] && [ ! -L "$image_cache_dir" ] \
+    && [ "$(stat -c '%U:%G:%a' -- "$image_cache_dir")" = 'caddy:caddy:700' ] \
+    || { echo "Unsafe image cache directory" >&2; exit 1; }
+else
+  install -d -o caddy -g caddy -m 0700 "$image_cache_dir"
+fi
+
 legacy_state_dir=$repo_dir/scripts
 legacy_state_file=$legacy_state_dir/disk_check_exclude.txt
 if [ ! -d "$legacy_state_dir" ] || [ -L "$legacy_state_dir" ] \
