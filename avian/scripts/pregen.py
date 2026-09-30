@@ -302,18 +302,17 @@ def fetch_wikipedia_thumb(sci: str, com: str) -> tuple[bytes, str] | None:
         # Prefer originalimage (higher res) over thumbnail.
         for k in ("originalimage", "thumbnail"):
             src = (meta.get(k) or {}).get("source")
-            # Wikipedia's REST summary now appends UTM tracking params to
-            # image URLs (".jpg?utm_source=..."), so an endswith() test on the
-            # whole URL never matches and every reference is silently
-            # skipped. Test the path component only.
-            src_path = urllib.parse.urlsplit(src).path if src else ""
-            if not src or not src_path.lower().endswith((".jpg", ".jpeg", ".png")):
+            if not isinstance(src, str) or not src:
                 continue
             try:
+                # Wikipedia image URLs may carry query strings or fragments.
+                src_path = urllib.parse.urlsplit(src).path
+                if not src_path.lower().endswith((".jpg", ".jpeg", ".png")):
+                    continue
                 req2 = urllib.request.Request(src, headers={"User-Agent": USER_AGENT})
                 with urllib.request.urlopen(req2, timeout=30) as r:
                     data = r.read()
-            except (urllib.error.HTTPError, urllib.error.URLError):
+            except (urllib.error.HTTPError, urllib.error.URLError, ValueError):
                 continue
             # Magic-byte sniff - URL extension is a hint, the bytes are
             # what Gemini's MIME check sees. Skip unknown formats rather
