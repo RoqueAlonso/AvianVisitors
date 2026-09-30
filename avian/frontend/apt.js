@@ -416,6 +416,10 @@
   }
   function setEducatorDataLoading(loading) {
     educatorDataLoading = !!loading;
+    if (loading) {
+      var frameCollage = document.getElementById('collage');
+      if (frameCollage) frameCollage.removeAttribute('data-frame-token');
+    }
     document.body.classList.toggle('educator-data-loading', !!loading);
     var root = document.getElementById('views');
     if (root) {
@@ -1082,6 +1086,7 @@
   // rectangles touching - actual polygon-aware packing.
 
   var collage = document.getElementById('collage');
+  var collageRenderRevision = 0;
   // DIMS[slug]=[w,h] (aspect) and MASKS[slug]={w,h,bits} (1-bit silhouette)
   // are built offline by scripts/build_masks.py and fetched from dims.json /
   // masks.json at load. They live in their own files (one key per line) so a
@@ -2732,7 +2737,15 @@
     return placed;
   }
 
+  function finishFrameRender(items, count) {
+    if (!DATA || !DATA.recent || DATA.recent.species !== items || !DATA.recent.frame_capture_id) return;
+    collage.setAttribute('data-frame-count', count);
+    collage.setAttribute('data-frame-token', DATA.recent.frame_capture_id);
+  }
+
   function renderCollage(items, animate) {
+    collage.removeAttribute('data-frame-token');
+    collage.setAttribute('data-frame-revision', ++collageRenderRevision);
     collage.innerHTML = '';
     // Drop the previous render's hit-test tiles up front so a click or hover on
     // the empty-nest state (or a collage that hasn't laid out yet) resolves to
@@ -2757,15 +2770,16 @@
         clearTimeout(collageEntranceT);
         collageEntranceT = setTimeout(function () { enest.classList.remove('entering'); }, 900);
       }
+      finishFrameRender(items, 0);
       return;
     }
     // Silhouettes (DIMS/MASKS) load async from dims.json/masks.json; until
     // they arrive we cannot pack. Defer and retry, like the !W/!H case below.
     // (The empty-nest path above needs no silhouettes and already returned.)
-    if (!tablesReady) { setTimeout(function () { renderCollage(items, animate); }, 80); return; }
-    if (labelsOn() && !labelFontReady) { setTimeout(function () { renderCollage(items, animate); }, 60); return; }
+    if (!tablesReady) { setTimeout(function () { renderCollageFromData(animate); }, 80); return; }
+    if (labelsOn() && !labelFontReady) { setTimeout(function () { renderCollageFromData(animate); }, 60); return; }
     var W = collage.clientWidth, H = collage.clientHeight;
-    if (!W || !H) { setTimeout(function () { renderCollage(items, animate); }, 80); return; }
+    if (!W || !H) { setTimeout(function () { renderCollageFromData(animate); }, 80); return; }
 
     // Tuning depends on bird count - same viewport, very different
     // pack densities for 6 vs 48 birds.
@@ -2973,6 +2987,7 @@
     // (first load, window change, view switch) - never on the silent 30s
     // poll or a resize, which render without the animate flag.
     if (animate) playCollageEntrance();
+    if (placed.length && collagePlaced.length === placed.length) finishFrameRender(items, placed.length);
   }
 
   // Staggered centre-out entrance: each tile fades + scales in, delayed by
@@ -3186,8 +3201,8 @@
   // changes, refreshRecent() refetches and re-renders. Empty state shows
   // the shared "no detections heard in this window" message.
   function renderCollageFromData(animate) {
-    var items = (DATA.recent && DATA.recent.species) || [];
-    renderCollage(items, animate);
+    if (!DATA.recent || !Array.isArray(DATA.recent.species)) return;
+    renderCollage(DATA.recent.species, animate);
   }
   var rTimer;
   window.addEventListener('resize', function () {
@@ -5645,12 +5660,22 @@
     function tolerate(fetching) {
       return transactional ? fetching : fetching.catch(function () { return null; });
     }
+    var recent = scopedFetchJson('recent', { hours: forHours }, request).then(function (data) {
+      if (!data || !Array.isArray(data.species)) throw new Error('invalid recent detections');
+      if (!transactional && request.generation === educatorScopeGeneration
+        && !educatorScopeId() && forHours === currentHours) {
+        DATA.recent = data;
+        if (typeof data.site_name === 'string') applySiteName(data.site_name);
+        renderCollageFromData(animate);
+      }
+      return data;
+    });
     return Promise.all([
       liveStats ? tolerate(scopedFetchJson('stats', {}, request)) : Promise.resolve(null),
       tolerate(scopedFetchJson('lifelist', {}, request)),
       tolerate(scopedFetchJson('timeseries', { days: 30 }, request)),
       liveStats ? tolerate(scopedFetchJson('firstseen', { limit: 10 }, request)) : Promise.resolve(null),
-      tolerate(scopedFetchJson('recent', { hours: forHours }, request)),
+      tolerate(recent),
       liveStats ? tolerate(scopedFetchJson('rhythm', { hours: forHours }, request)) : Promise.resolve(null),
       liveStats ? tolerate(scopedFetchJson('hourly', {}, request)) : Promise.resolve(null),
       calendarNeeded ? tolerate(scopedFetchJson('calendar', {}, request)) : Promise.resolve(null),

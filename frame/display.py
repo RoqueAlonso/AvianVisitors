@@ -93,7 +93,10 @@ def fetch_recent(base, hours, timeout, auth=None):
     if auth:
         req.add_header("Authorization", auth)
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read(2_000_000)).get("species", [])
+        data = json.loads(r.read(2_000_000))
+    if not isinstance(data, dict) or not isinstance(data.get("species"), list):
+        raise ValueError("recent API has no species list")
+    return data["species"]
 
 
 def signature(species, scope=""):
@@ -351,7 +354,7 @@ def frame_url(url, bird_names):
 
 
 # --- run --------------------------------------------------------------------
-def obtain_image(cfg, species=None):
+def obtain_image(cfg, species=None, *, capture=None):
     if cfg.get("species_source") == "birdweather":
         from shoot import shoot_birdweather
         if species is None:  # gate skipped (--no-signature): fetch the list to render
@@ -359,7 +362,7 @@ def obtain_image(cfg, species=None):
         out = os.path.join(os.path.expanduser(cfg["cache"]), "frame.png")
         os.makedirs(os.path.dirname(out), exist_ok=True)
         shoot_birdweather(out, species, title=cfg["shoot_title"], subtitle=cfg["shoot_subtitle"],
-                          timeout_ms=cfg["timeout"] * 1000, bird_names=cfg["bird_names"])
+                          timeout_ms=cfg["timeout"] * 1000, bird_names=cfg["bird_names"], capture=capture)
         return Image.open(out).convert("RGB")
     if cfg["shoot"]:
         from shoot import shoot
@@ -370,7 +373,7 @@ def obtain_image(cfg, species=None):
               lowercase=cfg["shoot_lowercase"], mat=cfg["shoot_mat"],
               small_floor=cfg["shoot_small_floor"], count_exp=cfg["shoot_count_exp"], timeout_ms=cfg["timeout"] * 1000,
               user=cfg["basic_user"], password=cfg["basic_pass"], window_hours=cfg["hours"],
-              bird_names=cfg["bird_names"])
+              bird_names=cfg["bird_names"], capture=capture)
         return Image.open(out).convert("RGB")
     src = cfg["image_url"] or cfg["image"]
     if not src:
@@ -408,7 +411,11 @@ def run(cfg, preview=None, force=False, use_signature=True, mat_box=False):
         print("refresh:", "changed" if changed else "heal")
 
     try:
-        img = fit_panel(obtain_image(cfg, species))
+        capture = {}
+        img = fit_panel(obtain_image(cfg, species, capture=capture))
+        if "species" in capture:
+            scope = birdweather_signature_scope(cfg) if cfg.get("species_source") == "birdweather" else ""
+            sig = signature(capture["species"], scope)
     except Exception as e:
         print(f"could not get image: {e}", file=sys.stderr)  # keep last panel image
         return

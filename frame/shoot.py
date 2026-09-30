@@ -24,7 +24,9 @@ import json
 import os
 import re
 import socketserver
+import stat
 import sys
+import tempfile
 import threading
 import urllib.parse
 
@@ -47,6 +49,22 @@ HIDE_CSS = """
   *, *::before, *::after { animation: none !important; transition: none !important; }
   html, body { background: var(--paper, #efece0) !important; }
 """
+
+FRAME_READY = """() => {
+  const c = document.getElementById('collage');
+  if (!c || !c.dataset.frameToken || document.body.classList.contains('educator-data-loading')) return false;
+  const count = Number(c.dataset.frameCount);
+  const tiles = [...c.querySelectorAll('.gtile')];
+  const images = [...c.querySelectorAll(count ? '.gtile img' : '.nest-img')];
+  if (tiles.length !== count || images.length !== (count || 1)
+    || !images.every(i => i.complete && i.naturalWidth > 0)) return false;
+  return {token: c.dataset.frameToken, revision: c.dataset.frameRevision};
+}"""
+
+FRAME_UNCHANGED = """expected => {
+  const current = (""" + FRAME_READY + """)();
+  return current && current.token === expected.token && current.revision === expected.revision;
+}"""
 
 
 def _frame_css(headline_px, eyebrow_px, lowercase, pad_top, pad_side, pad_bottom, collage_vh):
@@ -85,7 +103,7 @@ def _frame_url(url, bird_names):
     return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
 
 
-def _make_api_handler(floor_frac, window_hours, auth, species=None):
+def _make_api_handler(floor_frac, window_hours, auth, species=None, capture=None):
     """Re-window action=recent (to preview busy days) and floor the rarest
     counts so the packer draws them a little larger. With `species` set
     (--bird-weather), serve that list for recent and an empty body for the
@@ -104,8 +122,21 @@ def _make_api_handler(floor_frac, window_hours, auth, species=None):
                 kw = {"url": url}
                 if auth:
                     kw["headers"] = {**req.headers, "authorization": auth}
-                data = route.fetch(**kw).json()
-            sp = data.get("species", [])
+                response = route.fetch(**kw)
+                if not response.ok:
+                    raise RuntimeError(f"recent API returned HTTP {response.status}")
+                data = response.json()
+            if not isinstance(data, dict) or not isinstance(data.get("species"), list):
+                raise ValueError("recent API has no species list")
+            if any(not isinstance(s, dict) or not isinstance(s.get("sci"), str)
+                   or not s["sci"].strip() for s in data["species"]):
+                raise ValueError("recent API has an invalid species")
+            data = {**data, "species": [dict(s) for s in data["species"]]}
+            if capture is not None:
+                capture["token"] = capture.get("token", 0) + 1
+                capture["species"] = [dict(s) for s in data["species"]]
+                data["frame_capture_id"] = capture["token"]
+            sp = data["species"]
             if sp and floor_frac > 0:
                 floor = max((s.get("n") or 1) for s in sp) * floor_frac
                 for s in sp:
@@ -113,8 +144,11 @@ def _make_api_handler(floor_frac, window_hours, auth, species=None):
                         s["n"] = max(1, round(floor))
             route.fulfill(status=200, content_type="application/json", body=json.dumps(data))
         except Exception as e:
-            print(f"recent-API rewrite skipped: {e}", file=sys.stderr)
-            _safe_continue(route)
+            if capture is not None:
+                capture["error"] = str(e)
+            print(f"recent API failed: {e}", file=sys.stderr)
+            route.fulfill(status=502, content_type="application/json",
+                          body='{"error":"frame recent API failed"}')
     return handler
 
 
@@ -181,7 +215,7 @@ def shoot(url, out, *, title=None, subtitle=None, vw=600, vh=800, dsf=2,
           mat=0.04, collage_vh=52, cluster_xbias=1.0, cluster_ybias=1.2,
           count_exp=0.4, cluster_pad=1, label_min_px=11, small_floor=0.04, window_hours=None,
           timeout_ms=45000, user=None, password=None, species=None, cutout_base=None,
-          cutout_local=None, empty_text="listening for birds…", bird_names=False):
+          cutout_local=None, empty_text="listening for birds…", bird_names=False, capture=None):
     pad_side, pad_top, pad_bottom = int(vw * mat), int(vh * mat * 0.92), int(vh * mat)
     auth = "Basic " + base64.b64encode(f"{user}:{password or ''}".encode()).decode() if user else None
 
@@ -197,7 +231,8 @@ def shoot(url, out, *, title=None, subtitle=None, vw=600, vh=800, dsf=2,
                 ctx_kw["http_credentials"] = {"username": user, "password": password or ""}
             page = browser.new_context(**ctx_kw).new_page()
             misses = []
-            page.route("**/birdnet-api.php**", _make_api_handler(small_floor, window_hours, auth, species))
+            observed = {}
+            page.route("**/birdnet-api.php**", _make_api_handler(small_floor, window_hours, auth, species, observed))
             page.route("**/apt.js*", _make_js_handler(
                 cluster_xbias, cluster_ybias, count_exp, cluster_pad,
                 label_min_px, auth, misses))
@@ -221,43 +256,23 @@ def shoot(url, out, *, title=None, subtitle=None, vw=600, vh=800, dsf=2,
             if resp is None or not resp.ok:
                 raise RuntimeError(f"site returned {resp.status if resp else 'no response'}")
             if bird_names:
-                font_loaded = page.evaluate(
+                page.wait_for_function(
                     "async () => { const f = await document.fonts.load('600 16px Hand');"
                     " await document.fonts.ready;"
-                    " return f.length > 0 && document.fonts.check('600 16px Hand'); }")
-                if not font_loaded:
-                    raise RuntimeError("collage label font did not load")
-            # Wait for the collage, or for the empty-state element the page shows
-            # when the mic has heard nothing yet, so a birdless frame renders a
-            # clean title card fast instead of hanging until the timeout. A page
-            # with neither still times out here and stays fatal (keep last frame).
-            page.wait_for_selector(".gtile, .empty", state="attached", timeout=timeout_ms)
-            if page.query_selector(".gtile") is not None:
-                try:
-                    page.wait_for_function(
-                        "() => { const t=[...document.querySelectorAll('.gtile img')];"
-                        " return t.length>0 && t.every(i=>i.complete && i.naturalWidth>0); }",
-                        timeout=timeout_ms)
-                except PWTimeout:
-                    print("some illustrations did not finish loading; capturing anyway", file=sys.stderr)
-                if bird_names:
-                    missing_labels = page.evaluate(
-                        "() => [...document.querySelectorAll('.gtile')]"
-                        ".filter(t => !t.querySelector('.gtile-label text'))"
-                        ".map(t => t.getAttribute('data-sci') || '?')")
-                    if missing_labels:
-                        raise RuntimeError(
-                            "frame labels missing for: " + ", ".join(missing_labels))
-            elif page.query_selector(".nest-img") is not None:
-                # Birdless empty state: wait for the nest illustration to load so
-                # the frame never captures a blank collage area.
-                try:
-                    page.wait_for_function(
-                        "() => { const n=document.querySelector('.nest-img');"
-                        " return n && n.complete && n.naturalWidth>0; }",
-                        timeout=timeout_ms)
-                except PWTimeout:
-                    print("nest illustration did not finish loading; capturing anyway", file=sys.stderr)
+                    " return f.length > 0 && document.fonts.check('600 16px Hand'); }",
+                    timeout=timeout_ms)
+            try:
+                ready = page.wait_for_function(FRAME_READY, timeout=timeout_ms).json_value()
+            except PWTimeout as error:
+                reason = observed.get("error") or "collage not ready; update both the mic and frame if their versions differ"
+                raise RuntimeError(reason) from error
+            if bird_names:
+                missing_labels = page.evaluate(
+                    "() => [...document.querySelectorAll('#collage .gtile')]"
+                    ".filter(t => !t.querySelector('.gtile-label text'))"
+                    ".map(t => t.getAttribute('data-sci') || '?')")
+                if missing_labels:
+                    raise RuntimeError("frame labels missing for: " + ", ".join(missing_labels))
             if misses:
                 raise RuntimeError(f"apt.js tunables not found ({len(misses)}); refusing to ship a half-tuned frame")
 
@@ -274,9 +289,38 @@ def shoot(url, out, *, title=None, subtitle=None, vw=600, vh=800, dsf=2,
                 page.evaluate("() => { const e = document.querySelector('.empty'); if (e) e.style.display = 'none'; }")
             else:
                 page.evaluate("(t) => { const e = document.querySelector('.empty'); if (e) e.textContent = t; }", empty_text)
-            page.wait_for_timeout(250)
+            page.wait_for_function("""async () => {
+              await Promise.all([...document.querySelectorAll('#collage img')].map(i => i.decode()));
+              await document.fonts.ready;
+              await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+              return true;
+            }""", timeout=timeout_ms)
+            if (observed.get("error") or str(observed.get("token")) != ready["token"]
+                    or not page.evaluate(FRAME_UNCHANGED, ready)):
+                raise RuntimeError("collage changed before capture")
             # clip is CSS px; device_scale_factor scales the PNG to vw*dsf by vh*dsf = 1200x1600
-            page.screenshot(path=out, clip={"x": 0, "y": 0, "width": vw, "height": vh})
+            png = page.screenshot(type="png", clip={"x": 0, "y": 0, "width": vw, "height": vh})
+            if (observed.get("error") or str(observed.get("token")) != ready["token"]
+                    or not page.evaluate(FRAME_UNCHANGED, ready)):
+                raise RuntimeError("collage changed during capture")
+            try:
+                previous = os.stat(out, follow_symlinks=False)
+            except FileNotFoundError:
+                previous = None
+            if previous is not None and not stat.S_ISREG(previous.st_mode):
+                raise RuntimeError("capture output must be a regular file")
+            with tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.abspath(out))) as directory:
+                pending = os.path.join(directory, "shot.png")
+                with open(pending, "xb") as stream:
+                    stream.write(png)
+                    if previous is not None:
+                        current = os.fstat(stream.fileno())
+                        if (current.st_uid, current.st_gid) != (previous.st_uid, previous.st_gid):
+                            os.fchown(stream.fileno(), previous.st_uid, previous.st_gid)
+                        os.fchmod(stream.fileno(), stat.S_IMODE(previous.st_mode))
+                os.replace(pending, out)
+            if capture is not None:
+                capture["species"] = observed["species"]
         finally:
             browser.close()
     return out
