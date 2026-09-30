@@ -9203,7 +9203,6 @@
     document.getElementById('modalSci').textContent = sci;
     var sciParts = sci.trim().split(/\s+/);
     var family = window.STAMPS && window.STAMPS.latinOf ? window.STAMPS.latinOf(sci) : '';
-    if (!family && window.STAMPS && window.STAMPS.familyOf) family = window.STAMPS.familyOf(sci);
     document.getElementById('modalFamily').textContent = family || '-';
     document.getElementById('modalGenus').textContent = sciParts[0] || '-';
     document.getElementById('modalSpecies').textContent = sciParts.slice(1).join(' ') || '-';
