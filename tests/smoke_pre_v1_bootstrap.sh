@@ -51,7 +51,7 @@ git -C "$seed" commit -qm 'pre-v1 station'
 git -C "$seed" switch -qc avian-visitors
 
 for script in \
-  admin_control.sh archive_control.sh link_webroot.sh maintenance_control.sh \
+  admin_control.sh archive_control.sh educators_control.sh bootstrap_v1.sh link_webroot.sh maintenance_control.sh \
   reinstall_services.sh security_refresh.sh update_birdnet.sh \
   update_birdnet_snippets.sh; do
   cp "/source/scripts/$script" "$seed/scripts/$script"
@@ -124,6 +124,7 @@ chmod 0440 /etc/sudoers.d/010_caddy-nopasswd
 
 cat >/usr/local/bin/systemctl <<'EOF'
 #!/usr/bin/env bash
+[ ! -e /tmp/avian-pre-v1-bootstrap/fail-security ] || exit 74
 printf '%s\n' "$*" >>/tmp/avian-pre-v1-bootstrap/systemctl.log
 exit 0
 EOF
@@ -141,6 +142,7 @@ printf '%s\n' "$*" >>/tmp/avian-pre-v1-bootstrap/mktemp.log
 exec /usr/bin/mktemp "$@"
 EOF
 chmod 0755 /usr/local/bin/systemctl /usr/local/bin/mktemp
+cp /usr/local/bin/systemctl /usr/bin/systemctl
 
 runuser -u "$station_user" -- env HOME="$station_home" \
   USER="$station_user" PATH=/usr/local/bin:/usr/bin:/bin \
@@ -214,13 +216,52 @@ EOF
 printf 'caddy ALL=(ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/010_caddy-nopasswd
 chmod 0440 /etc/sudoers.d/010_caddy-nopasswd
 
+# Bootstrap must keep the release it verified even when the branch advances
+# before the station fetch. The later release changes privileged helper bytes.
+printf '\n# later release\n' >>"$seed/scripts/admin_control.sh"
+git -C "$seed" add scripts/admin_control.sh
+git -C "$seed" commit -qm 'release after bootstrap snapshot'
+git -C "$seed" push -q "$remote" avian-visitors
+git -C "$seed" rev-parse HEAD >"$test_root/future-head"
+git -C "$remote" update-ref refs/heads/avian-visitors "$release_head"
+cat >/usr/local/bin/git <<'EOF'
+#!/usr/bin/env bash
+if [ -e /tmp/avian-pre-v1-bootstrap/fail-fetch ] && [[ " $* " = *' fetch '* ]]; then exit 71; fi
+if [[ "$*" = *avian-v1-bootstrap.* ]] && [[ " $* " = *' fetch '* ]]; then
+  /usr/bin/git "$@" || exit $?
+  /usr/bin/git -C /tmp/avian-pre-v1-bootstrap/official.git update-ref refs/heads/avian-visitors "$(cat /tmp/avian-pre-v1-bootstrap/future-head)"
+  chmod 0644 /tmp/avian-pre-v1-bootstrap/official.git/refs/heads/avian-visitors
+  exit 0
+fi
+exec /usr/bin/git "$@"
+EOF
+chmod 0755 /usr/local/bin/git
+cat >/usr/local/bin/install <<'EOF'
+#!/usr/bin/env bash
+if [ -e /tmp/avian-pre-v1-bootstrap/fail-install ] && [[ "$*" = *avian-update-control* ]]; then exit 73; fi
+exec /usr/bin/install "$@"
+EOF
+chmod 0755 /usr/local/bin/install
+touch "$test_root/fail-install"
+if bash /source/scripts/bootstrap_v1.sh >"$test_root/bootstrap.log" 2>&1; then fail 'interrupted bootstrap reported success'; fi
+[ "$(runuser -u "$collision_user" -- git -C "$collision_repo" branch --show-current)" = main ] || fail 'interrupted preparation changed checkout'
+[ "$(cat /var/lib/avian-update-prepared/release)" = "$release_head" ] || fail 'bootstrap did not retain its verified snapshot'
+rm "$test_root/fail-install"
+touch "$test_root/fail-security"
+if bash /source/scripts/bootstrap_v1.sh >"$test_root/bootstrap.log" 2>&1; then fail 'interrupted bootstrap application reported success'; fi
+[ "$(runuser -u "$collision_user" -- git -C "$collision_repo" rev-parse HEAD)" = "$release_head" ] || fail 'application failure rolled back selected checkout'
+! grep -q 'AvianVisitors update complete' "$test_root/bootstrap.log" || fail 'application failure printed success'
+[ "$(cat /var/lib/avian-update-prepared/phase)" = applying ] || fail 'application failure lost resumable phase'
+rm "$test_root/fail-security"
+touch "$test_root/fail-fetch"
 bash /source/scripts/bootstrap_v1.sh >"$test_root/bootstrap.log" 2>&1 \
   || { cp "$test_root/bootstrap.log" "$test_root/update.log"; fail 'v1 bootstrap could not migrate untracked overlay files'; }
 
 grep -q '/var/tmp/avian-v1-bootstrap.' "$test_root/mktemp.log" \
   || fail 'v1 bootstrap did not place its verified fetch on persistent storage'
-grep -q '/var/tmp/avian-service-refresh.' "$test_root/mktemp.log" \
-  || fail 'service refresh did not place its verified fetch on persistent storage'
+if grep -q '/var/tmp/avian-service-refresh.' "$test_root/mktemp.log"; then
+  fail 'bootstrap handoff fetched another root helper snapshot'
+fi
 if find /var/tmp -maxdepth 1 -type d \
   \( -name 'avian-v1-bootstrap.*' -o -name 'avian-service-refresh.*' \) \
   -print -quit | grep -q .; then
@@ -231,6 +272,9 @@ fi
   || fail 'v1 bootstrap did not select the release branch'
 [ "$(runuser -u "$collision_user" -- git -C "$collision_repo" rev-parse HEAD)" = "$release_head" ] \
   || fail 'v1 bootstrap did not reach the release commit'
+git -C "$remote" show "$release_head:scripts/admin_control.sh" >"$test_root/selected-admin"
+cmp "$test_root/selected-admin" /usr/local/sbin/avian-admin-control || fail 'bootstrap applied a different release helper'
+[ ! -e /var/lib/avian-update-prepared ] || fail 'successful bootstrap retained pending application'
 grep -qx index.html "$collision_repo/avian/frontend/index.html" \
   || fail 'release page did not replace its legacy collision'
 grep -q '"shared-bird"' "$collision_repo/avian/frontend/masks.json" \

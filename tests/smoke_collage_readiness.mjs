@@ -31,6 +31,7 @@ let siteName = 'BirdNET-Pi';
 const bird = { sci: 'Corvus brachyrhynchos', com: 'American Crow', n: 2 };
 const delayedStats = new Promise(resolve => { finishStats = resolve; });
 const refresh = {
+  window: {},
   DATA: { calendar: {}, recent: null },
   educatorScopeBlocked: false, educatorDataLoading: false, educatorScopeGeneration: 0,
   currentHours: 24, hourlyDate: null, console,
@@ -57,10 +58,11 @@ assert.equal(siteName, 'Garden birds', 'the early collage carries its station ti
 finishStats({});
 await pending;
 
-for (const mode of ['transactional', 'changed-scope', 'changed-window']) {
+for (const mode of ['transactional', 'changed-scope', 'changed-window', 'frame', 'frame-stats-error']) {
   let finishRecent;
   refresh.DATA.recent = null;
   refresh.educatorDataLoading = mode === 'transactional';
+  refresh.window.__avianFrameCapture = mode.startsWith('frame');
   refresh.educatorScopeGeneration = 0;
   refresh.currentHours = 24;
   refresh.setEducatorDataLoading = loading => { refresh.educatorDataLoading = loading; };
@@ -73,8 +75,12 @@ for (const mode of ['transactional', 'changed-scope', 'changed-window']) {
   finishRecent({ species: [bird] });
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(earlyDraws, before, `${mode} cannot use the ordinary early-render path`);
-  finishStats({});
+  finishStats(mode === 'frame-stats-error' ? Promise.reject(new Error('stats unavailable')) : {});
   await inFlight;
+  if (mode.startsWith('frame')) {
+    assert.equal(earlyDraws, before + 1, 'frame capture renders once after the initial batch settles');
+    assert.equal(refresh.DATA.recent.species[0].sci, bird.sci);
+  }
 }
 
 const shooter = fs.readFileSync(new URL('../frame/shoot.py', import.meta.url), 'utf8');

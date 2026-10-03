@@ -88,7 +88,7 @@ Listening periods scope the Collage, Stats, Atlas, and available detection clips
 
 ### Updating an existing station
 
-For the first v1 update, keep the existing checkout and run:
+For the first v1 update, or if an interrupted older update left the admin helper missing and Tools locked, keep the existing checkout and run this verified setup over SSH:
 
 ```bash
 upgrade=$(mktemp "$HOME/avian-v1-upgrade.XXXXXX")
@@ -104,12 +104,13 @@ cd ~/BirdNET-Pi
 ./scripts/update_birdnet.sh
 ```
 
-The updater keeps generated mask data and stops if tracked files have local edits. If its service setup needs repair, use **Tools → Reinstall services** or run:
+The updater preserves custom bird artwork, generated mask data, and existing credentials. It stops if other tracked files have local edits. It verifies and stages one official release before changing the checkout. If applying that release is interrupted, keep the new checkout and resume the same prepared installation without fetching another release:
 
 ```bash
-cd ~/BirdNET-Pi
-./scripts/reinstall_services.sh
+sudo /usr/local/sbin/avian-service-refresh
 ```
+
+If the installed refresher itself is missing or unsafe, use the verified setup command above. An already-running older updater cannot gain the new preparation checks until it has finished or been recovered this way. Only use `sudo /usr/local/sbin/avian-admin-control password-reset` for missing credentials after the helper is installed successfully.
 
 ---
 

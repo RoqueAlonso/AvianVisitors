@@ -33,6 +33,7 @@ from PIL import Image, ImageDraw, ImageFilter
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import pregen  # noqa: E402  (reuses gen_one + the reference machinery)
+from image_files import open_source_image, save_png_atomic  # noqa: E402
 
 ILLUS = HERE.parent / "assets" / "illustrations"
 RAW = ILLUS / "raw"
@@ -65,7 +66,8 @@ def chroma_cut(src: Path, dst: Path) -> None:
     eats pale plumage). The border strips are guaranteed paper - their
     99th percentile, widened, clears grain and vignette while staying
     far below the inked outline."""
-    im = Image.open(src).convert("RGB")
+    with open_source_image(src.read_bytes()) as source:
+        im = source.convert("RGB")
     arr = np.asarray(im)
     h, w, _ = arr.shape
     corners = np.concatenate([arr[:15, :15].reshape(-1, 3), arr[:15, -15:].reshape(-1, 3),
@@ -113,7 +115,7 @@ def chroma_cut(src: Path, dst: Path) -> None:
     pad = round(0.03 * max(y1 - y0, x1 - x0))
     y0 = max(0, y0 - pad); x0 = max(0, x0 - pad)
     y1 = min(h, y1 + pad); x1 = min(w, x1 + pad)
-    Image.fromarray(rgba[y0:y1, x0:x1], "RGBA").save(dst)
+    save_png_atomic(Image.fromarray(rgba[y0:y1, x0:x1]), dst)
 
 
 def record_cut(slug: str, kind: str) -> None:

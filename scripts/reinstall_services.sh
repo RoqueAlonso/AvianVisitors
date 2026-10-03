@@ -15,8 +15,10 @@ readonly FIXED_HELPER='/usr/local/sbin/avian-service-refresh'
 readonly SECURITY_HELPER='/usr/local/sbin/avian-security-refresh'
 readonly CADDY_HELPER='/usr/local/sbin/avian-caddy-refresh'
 readonly WEBROOT_HELPER='/usr/local/sbin/avian-link-webroot'
+readonly PREPARED_DIR='/var/lib/avian-update-prepared'
 
 refresh_mode=full
+selected_head=''
 case "$#" in
   0) ;;
   1)
@@ -27,7 +29,16 @@ case "$#" in
       *) echo 'Usage: avian-service-refresh [--legacy-migration|--audio-policy|--helper-bootstrap]' >&2; exit 64 ;;
     esac
     ;;
-  *) echo 'Usage: avian-service-refresh [--legacy-migration|--audio-policy|--helper-bootstrap]' >&2; exit 64 ;;
+  2)
+    case "$1" in
+      --prepare-update) refresh_mode=prepare ;;
+      --apply-prepared) refresh_mode=apply ;;
+      *) exit 64 ;;
+    esac
+    selected_head=$2
+    [[ "$selected_head" =~ ^[0-9a-f]{40}$ ]] || exit 64
+    ;;
+  *) echo 'Usage: avian-service-refresh [--prepare-update SHA|--apply-prepared SHA]' >&2; exit 64 ;;
 esac
 
 die() {
@@ -207,27 +218,9 @@ case "$origin_url" in
 esac
 
 current_branch=$(git_station symbolic-ref --quiet --short HEAD || true)
-[ "$current_branch" = "$RELEASE_BRANCH" ] \
+[ "$current_branch" = "$RELEASE_BRANCH" ] || [ "$refresh_mode:$current_branch" = prepare:main ] \
   || die "checkout must be on $RELEASE_BRANCH"
 current_head=$(git_station rev-parse --verify HEAD)
-
-# Privileged helper bytes must not be trusted merely because they are clean in
-# a station-owned checkout. Fetch the official release into a root-owned
-# temporary object store, then require the checkout to be on that exact commit.
-work_dir=$(mktemp -d /var/tmp/avian-service-refresh.XXXXXX)
-trusted_repo=$work_dir/official.git
-cleanup() { rm -rf "$work_dir"; }
-trap cleanup EXIT
-mkdir "$trusted_repo"
-git_trusted init --bare -q
-if ! git_trusted fetch --no-tags \
-  "${OFFICIAL_ORIGIN}.git" \
-  "refs/heads/$RELEASE_BRANCH:refs/heads/$RELEASE_BRANCH"; then
-  die "could not verify origin/$RELEASE_BRANCH"
-fi
-verified_head=$(git_trusted rev-parse --verify "refs/heads/$RELEASE_BRANCH^{commit}")
-[ "$current_head" = "$verified_head" ] \
-  || die "checkout is not the current official $RELEASE_BRANCH release; update first"
 
 helper_sources=(
   scripts/update_birdnet.sh
@@ -252,24 +245,87 @@ helper_targets=(
   /usr/local/sbin/avian-educators
 )
 
+validate_prepared() {
+  local file helper_source expected_manifest
+  [ -d "$PREPARED_DIR" ] && [ ! -L "$PREPARED_DIR" ] \
+    && [ "$(stat -c '%u:%g:%a' "$PREPARED_DIR")" = 0:0:700 ] \
+    || die 'prepared release directory is unsafe'
+  for file in release manifest phase "${helper_sources[@]##*/}"; do
+    [ -f "$PREPARED_DIR/$file" ] && [ ! -L "$PREPARED_DIR/$file" ] \
+      && [ "$(stat -c '%u:%g:%a:%h' "$PREPARED_DIR/$file")" = 0:0:600:1 ] \
+      || die "prepared release file is unsafe: $file"
+  done
+  verified_head=$(cat "$PREPARED_DIR/release")
+  [[ "$verified_head" =~ ^[0-9a-f]{40}$ ]] || die 'prepared release identity is invalid'
+  [ -z "$selected_head" ] || [ "$selected_head" = "$verified_head" ] \
+    || die 'another release is pending; run sudo /usr/local/sbin/avian-update-control to resume'
+  case "$(cat "$PREPARED_DIR/phase")" in prepared|applying) ;; *) die 'prepared release phase is invalid' ;; esac
+  # Recompute the complete manifest, rather than accepting paths supplied by it.
+  expected_manifest=$(cd "$PREPARED_DIR" && sha256sum release "${helper_sources[@]##*/}")
+  [ "$(cat "$PREPARED_DIR/manifest")" = "$expected_manifest" ] \
+    || die 'prepared release manifest does not match'
+  for helper_source in "${helper_sources[@]}"; do
+    bash -n "$PREPARED_DIR/${helper_source##*/}" || die 'prepared helper syntax is invalid'
+  done
+}
+
+created_preparation=false
+if [ -e "$PREPARED_DIR" ] || [ -L "$PREPARED_DIR" ]; then
+  validate_prepared
+else
+  [ "$refresh_mode" != apply ] || die 'no prepared release; run verified update setup'
+  work_dir=$(mktemp -d /var/tmp/avian-service-refresh.XXXXXX)
+  trusted_repo=$work_dir/official.git
+  snapshot_temp=''
+  cleanup() {
+    [ -z "$snapshot_temp" ] || rm -rf -- "$snapshot_temp"
+    rm -rf -- "$work_dir"
+  }
+  trap cleanup EXIT
+  mkdir "$trusted_repo"
+  git_trusted init --bare -q
+  if ! git_trusted fetch --no-tags "${OFFICIAL_ORIGIN}.git" \
+    "refs/heads/$RELEASE_BRANCH:refs/heads/$RELEASE_BRANCH"; then
+    die "could not verify origin/$RELEASE_BRANCH"
+  fi
+  verified_head=$(git_trusted rev-parse --verify "refs/heads/$RELEASE_BRANCH^{commit}")
+  [ "${selected_head:-$current_head}" = "$verified_head" ] \
+    || die "checkout is not the current official $RELEASE_BRANCH release; update first"
+  snapshot_temp=$(mktemp -d /var/lib/.avian-update-prepared.XXXXXX)
+  stage_dir=$snapshot_temp
+  printf '%s\n' "$verified_head" >"$stage_dir/release"
+  printf 'prepared\n' >"$stage_dir/phase"
+  for helper_source in "${helper_sources[@]}"; do
+    staged_helper=$stage_dir/${helper_source##*/}
+    git_trusted show "$verified_head:$helper_source" >"$staged_helper"
+    bash -n "$staged_helper" || die "privileged helper has invalid shell syntax: $helper_source"
+    chmod 0600 "$staged_helper"
+  done
+  (cd "$stage_dir" && sha256sum release "${helper_sources[@]##*/}") >"$stage_dir/manifest"
+  mv "$stage_dir" "$PREPARED_DIR"
+  snapshot_temp=''
+  validate_prepared
+  created_preparation=true
+fi
+stage_dir=$PREPARED_DIR
+if [ "$refresh_mode" = prepare ]; then
+  if [ "$(cat "$PREPARED_DIR/phase")" = applying ] && [ "$current_head" != "$verified_head" ]; then
+    die 'partially applied release does not match checkout; restore the selected checkout before resuming'
+  fi
+  echo "Prepared AvianVisitors release $verified_head."
+  exit 0
+fi
+[ "$current_head" = "$verified_head" ] \
+  || die 'prepared release does not match checkout; run sudo /usr/local/sbin/avian-update-control to resume'
 for helper_source in "${helper_sources[@]}"; do
   git_station ls-files --error-unmatch -- "$helper_source" >/dev/null \
     || die "privileged helper is not tracked: $helper_source"
   git_station diff --quiet --no-ext-diff "$current_head" -- "$helper_source" \
     || die "privileged helper has local changes: $helper_source"
 done
-
-stage_dir=$work_dir/helpers
-mkdir "$stage_dir"
-
-for index in "${!helper_sources[@]}"; do
-  helper_source=${helper_sources[$index]}
-  staged_helper=$stage_dir/$(basename "$helper_source")
-  git_trusted show "$verified_head:$helper_source" >"$staged_helper"
-  bash -n "$staged_helper" \
-    || die "privileged helper has invalid shell syntax: $helper_source"
-  chmod 0700 "$staged_helper"
-done
+phase_temp=$(mktemp "$PREPARED_DIR/.phase.XXXXXX")
+printf 'applying\n' >"$phase_temp"
+mv -f "$phase_temp" "$PREPARED_DIR/phase"
 
 install_root_helper() {
   local source_path=$1 target_path=$2 target_temp
@@ -289,6 +345,12 @@ done
 # this verified installer under the inherited update lock for this one narrow
 # completion pass.
 if [ "$refresh_mode" = helper-bootstrap ]; then
+  # The historical caller owns the remaining refresh. Retain any pre-existing
+  # full-update recovery snapshot, but do not leave this completed helper-only
+  # pass pinned as an interrupted application.
+  if [ "$created_preparation" = true ]; then
+    rm -rf "$PREPARED_DIR"
+  fi
   echo 'AvianVisitors privileged helpers refreshed.'
   exit 0
 fi
@@ -355,4 +417,5 @@ safe_root_helper "$CADDY_HELPER" \
   || die "root-owned Caddy refresher is unsafe: $CADDY_HELPER"
 "$CADDY_HELPER"
 
+rm -rf "$PREPARED_DIR"
 echo 'AvianVisitors service refresh complete.'

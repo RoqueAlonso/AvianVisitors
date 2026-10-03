@@ -5662,7 +5662,7 @@
     }
     var recent = scopedFetchJson('recent', { hours: forHours }, request).then(function (data) {
       if (!data || !Array.isArray(data.species)) throw new Error('invalid recent detections');
-      if (!transactional && request.generation === educatorScopeGeneration
+      if (!window.__avianFrameCapture && !transactional && request.generation === educatorScopeGeneration
         && !educatorScopeId() && forHours === currentHours) {
         DATA.recent = data;
         if (typeof data.site_name === 'string') applySiteName(data.site_name);
@@ -5755,14 +5755,14 @@
   var educatorScopeProbeSnapshot = null;
   var educatorScopeProbeFastUntil = 0;
   function educatorScopeNeedsRealtimePolling() {
-    if (educatorScopeBlocked) return false;
+    if (window.__avianFrameCapture || educatorScopeBlocked) return false;
     if (!effectiveEducatorScope) return true;
     if (effectiveEducatorScope.automatic) return true;
     return effectiveEducatorScope.status === 'running';
   }
   function educatorScopeNeedsProbe() {
     var scopeId = educatorRequestScopeId();
-    return !educatorScopeBlocked && !!effectiveEducatorScope
+    return !window.__avianFrameCapture && !educatorScopeBlocked && !!effectiveEducatorScope
       && !effectiveEducatorScope.automatic && validEducatorId(scopeId)
       && !educatorScopeNeedsRealtimePolling();
   }
@@ -5924,7 +5924,8 @@
   }
   function runPeriodicRefresh(force) {
     force = !!force;
-    if (document.hidden || (!force && !educatorScopeNeedsRealtimePolling())) {
+    // A frame capture keeps one snapshot, even when capture takes over 30 seconds.
+    if (window.__avianFrameCapture || document.hidden || (!force && !educatorScopeNeedsRealtimePolling())) {
       return Promise.resolve(false);
     }
     if (periodicRefreshInFlight) {
@@ -6324,7 +6325,21 @@
     return '';
   }
 
-  function showAdminLocked(message, recovery, revealDrawer) {
+  function setAdminLockHint(message, recovery, installationRecovery) {
+    if (installationRecovery) {
+      lockHint.textContent = 'Admin installation is incomplete or unsafe. Over SSH, run the verified setup in ';
+      var link = document.createElement('a');
+      link.href = 'https://github.com/Twarner491/AvianVisitors#updating-an-existing-station';
+      link.textContent = 'the installation recovery instructions';
+      lockHint.appendChild(link);
+      return;
+    }
+    lockHint.textContent = recovery
+      ? 'Admin password is missing or invalid. Over SSH, run sudo /usr/local/sbin/avian-admin-control password-reset.'
+      : (typeof message === 'string' ? message : 'Your admin session expired. Unlock to continue.');
+  }
+
+  function showAdminLocked(message, recovery, revealDrawer, installationRecovery) {
     var wasAdminOn = document.body.classList.contains('admin-on');
     var previousAdminSect = adminSect;
     var focusBeforeLock = document.activeElement;
@@ -6403,9 +6418,7 @@
     }
     locked.style.display = '';
     if (wasAdminOn) queueVisibleAtlasPack();
-    lockHint.textContent = recovery
-      ? 'Admin password is missing or invalid. Over SSH, run sudo /usr/local/sbin/avian-admin-control password-reset.'
-      : (typeof message === 'string' ? message : 'Your admin session expired. Unlock to continue.');
+    setAdminLockHint(message, recovery, installationRecovery);
     lockHint.classList.toggle('lock-err', !!lockHint.textContent);
     if (sharedPublicFocus && scopeReturnBeforeLock && !scopeReturnBeforeLock.hidden) focusEl(scopeReturnBeforeLock);
     else restoreFocusAfterAdminLock(focusNeedsPublicHome, revealDrawer);
@@ -6558,7 +6571,7 @@
           || requestViewGeneration !== adminViewGeneration) {
           return cancelledAdminRequest('stale admin error response');
         }
-        showAdminLocked('Your admin session expired. Unlock to continue.', !!body.recovery);
+        showAdminLocked('Your admin session expired. Unlock to continue.', !!body.recovery, false, !!body.installation_recovery);
         signalAdminLock('Admin session expired. Unlock to continue.');
         tryAutoUnlock();
         return cancelledAdminRequest('admin session expired');
@@ -6635,7 +6648,7 @@
           return;
         }
         var message = 'Admin controls locked after 30 minutes of inactivity.';
-        showAdminLocked(message, !!result.recovery);
+        showAdminLocked(message, !!result.recovery, false, !!result.installation_recovery);
         signalAdminLock(message);
       }).catch(function () {
         if (idleAuthGeneration !== adminAuthGeneration
@@ -6701,7 +6714,7 @@
       if (r.status === 401) {
         return r.json().catch(function () { return {}; }).then(function (j) {
           if (probeGeneration !== adminUnlockProbeGeneration) return;
-          showAdminLocked('', !!j.recovery);
+          showAdminLocked('', !!j.recovery, false, !!j.installation_recovery);
         });
       }
     }).catch(function () { });
@@ -6755,9 +6768,7 @@
         });
       } else if (r.status === 401) {
         return r.json().catch(function () { return {}; }).then(function (body) {
-          lockHint.textContent = body.recovery
-            ? 'Admin password is missing or invalid. Over SSH, run sudo /usr/local/sbin/avian-admin-control password-reset.'
-            : 'Wrong password.';
+          setAdminLockHint('Wrong password.', !!body.recovery, !!body.installation_recovery);
           lockHint.classList.add('lock-err');
           passInput.focus();
         });

@@ -41,10 +41,21 @@ if ($pose !== 2) $pose = 1;
 $poseSuffix = $pose === 1 ? '' : "-$pose";
 
 function serve_png(string $path): void {
+    $stream = @fopen($path, 'rb');
+    $metadata = $stream === false ? false : fstat($stream);
+    if ($metadata === false || ($metadata['mode'] & 0170000) !== 0100000
+        || $metadata['size'] <= 0) {
+        if (is_resource($stream)) fclose($stream);
+        http_response_code(500);
+        header('Content-Type: text/plain');
+        echo 'illustration could not be read';
+        exit;
+    }
     header('Content-Type: image/png');
     header('Cache-Control: public, max-age=86400');
-    header('Content-Length: ' . (string)filesize($path));
-    readfile($path);
+    header('Content-Length: ' . (string)$metadata['size']);
+    fpassthru($stream);
+    fclose($stream);
     exit;
 }
 
@@ -166,12 +177,19 @@ if (!$imgBytes || strlen($imgBytes) < 1024) {
 // rembg via the wrapper. u2netp = lightweight model (~50MB peak RAM -
 // matters on the Pi 3B+). Temp files because rembg's CLI prefers
 // real paths.
-$tmpInBase  = tempnam(sys_get_temp_dir(), 'rembg-in-');
-$tmpOutBase = tempnam(sys_get_temp_dir(), 'rembg-out-');
-@unlink($tmpInBase); @unlink($tmpOutBase);
-$tmpIn  = $tmpInBase  . '.jpg';
-$tmpOut = $tmpOutBase . '.png';
-file_put_contents($tmpIn, $imgBytes);
+$tmpIn = @tempnam($cacheDir, '.rembg-in-');
+$tmpOut = @tempnam($cacheDir, '.rembg-out-');
+// tempnam can fall back to the system temp directory on failure.
+if ($tmpIn === false || $tmpOut === false
+    || realpath(dirname($tmpIn)) !== realpath($cacheDir)
+    || realpath(dirname($tmpOut)) !== realpath($cacheDir)
+    || @file_put_contents($tmpIn, $imgBytes) !== strlen($imgBytes)) {
+    if ($tmpIn !== false) @unlink($tmpIn);
+    if ($tmpOut !== false) @unlink($tmpOut);
+    http_response_code(500);
+    echo 'could not stage cutout';
+    exit;
+}
 
 $cmd = sprintf(
     '%s i -m u2netp -ppm %s %s 2>&1',
@@ -194,32 +212,44 @@ if (!is_file($tmpOut) || filesize($tmpOut) < 1024) {
 // Tight-crop to the bird's bounding box + downscale to 800px max edge
 // so cache stays small.
 $im = @imagecreatefrompng($tmpOut);
-if ($im !== false) {
-    $cropped = @imagecropauto($im, IMG_CROP_TRANSPARENT);
-    if ($cropped !== false) {
-        imagedestroy($im);
-        $im = $cropped;
-    }
-    $w = imagesx($im); $h = imagesy($im);
-    $max = 800;
-    if ($w > $max || $h > $max) {
-        $scale = $max / max($w, $h);
-        $nw = (int)($w * $scale); $nh = (int)($h * $scale);
-        $resized = imagecreatetruecolor($nw, $nh);
-        imagealphablending($resized, false);
-        imagesavealpha($resized, true);
-        imagecopyresampled($resized, $im, 0, 0, 0, 0, $nw, $nh, $w, $h);
-        imagedestroy($im);
-        $im = $resized;
-    }
-    imagealphablending($im, false);
-    imagesavealpha($im, true);
-    imagepng($im, $tmpOut, 6);
-    imagedestroy($im);
+if ($im === false) {
+    @unlink($tmpOut);
+    http_response_code(500);
+    echo 'rembg returned an invalid PNG';
+    exit;
 }
+$cropped = @imagecropauto($im, IMG_CROP_TRANSPARENT);
+if ($cropped !== false) {
+    imagedestroy($im);
+    $im = $cropped;
+}
+$w = imagesx($im); $h = imagesy($im);
+$max = 800;
+if ($w > $max || $h > $max) {
+    $scale = $max / max($w, $h);
+    $nw = (int)($w * $scale); $nh = (int)($h * $scale);
+    $resized = imagecreatetruecolor($nw, $nh);
+    imagealphablending($resized, false);
+    imagesavealpha($resized, true);
+    imagecopyresampled($resized, $im, 0, 0, 0, 0, $nw, $nh, $w, $h);
+    imagedestroy($im);
+    $im = $resized;
+}
+imagealphablending($im, false);
+imagesavealpha($im, true);
+$saved = @imagepng($im, $tmpOut, 6);
+imagedestroy($im);
+// GD can report success after a short write, so decode the encoded file too.
+$encoded = $saved ? @imagecreatefrompng($tmpOut) : false;
+if ($encoded !== false) imagedestroy($encoded);
 
 // Atomic install: rename is atomic on the same filesystem, so any
 // concurrent reader either sees the old cached file or the new one,
 // never a half-written PNG.
-@rename($tmpOut, $cachePath);
+if ($encoded === false || !@chmod($tmpOut, 0644) || !@rename($tmpOut, $cachePath)) {
+    @unlink($tmpOut);
+    http_response_code(500);
+    echo 'could not publish cutout';
+    exit;
+}
 serve_png($cachePath);

@@ -45,8 +45,8 @@ def main() -> int:
     args = ap.parse_args()
 
     try:
-        from PIL import Image
         from rembg import new_session, remove
+        from image_files import open_source_image, save_png_atomic
     except ImportError:
         print("error: needs Pillow + rembg (pip install -r requirements.txt)",
               file=sys.stderr)
@@ -72,18 +72,18 @@ def main() -> int:
     session = new_session(args.model)
     done = skipped = 0
     for p in paths:
-        im = Image.open(p)
-        if not args.force and im.mode == "RGBA" and im.getchannel("A").getextrema()[0] == 0:
-            skipped += 1
-            continue
-        cut = remove(im.convert("RGB"), session=session)  # RGBA, ground -> transparent
+        with open_source_image(p.read_bytes()) as im:
+            if not args.force and im.mode == "RGBA" and im.getchannel("A").getextrema()[0] == 0:
+                skipped += 1
+                continue
+            cut = remove(im.convert("RGB"), session=session)  # RGBA, ground -> transparent
         bbox = cut.getchannel("A").getbbox()
         if bbox:
             pad = round(args.margin * max(bbox[2] - bbox[0], bbox[3] - bbox[1]))
             x0, y0 = max(0, bbox[0] - pad), max(0, bbox[1] - pad)
             x1, y1 = min(cut.width, bbox[2] + pad), min(cut.height, bbox[3] + pad)
             cut = cut.crop((x0, y0, x1, y1))
-        cut.save(p)
+        save_png_atomic(cut, p)
         done += 1
         print(f"  [cut]  {p.name}  -> {cut.width}x{cut.height}")
 

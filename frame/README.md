@@ -83,16 +83,19 @@ Set `shoot_title = ""` in `~/.birdframe/config.toml` if you want to hide only th
 
 For an `--image-url` frame, the command adds `labels=1` or `labels=0` to the source URL. The source must honor that setting; otherwise its image will not change.
 
-When updating a paired mic and frame, update both. The frame waits for the mic's collage to finish loading before capturing it. An older mic frontend cannot confirm this, so the frame keeps its previous image and logs an update reminder.
+When updating a paired mic and frame, update both. The frame waits for the mic's collage to finish loading before capturing it. An older mic frontend cannot confirm this, so the frame keeps its previous image and logs an update reminder. Capture now requires Pillow as well as Playwright, including standalone `shoot.py` use.
 
 Update the mic through **Tools > Pull latest**. On the frame Pi, pull the update and request a fresh capture:
 
 ```bash
 cd ~/AvianVisitors/frame && git pull --ff-only && \
+  .venv/bin/pip install -r requirements-shoot.txt && \
   .venv/bin/python display.py --config ~/.birdframe/config.toml --force
 ```
 
 If Git reports local edits, preserve them and resolve that before updating.
+
+Slow, incomplete, or corrupt artwork and a changing collage leave the last good frame and refresh state untouched. Capture validates the exact PNG/WebP responses used by the browser, then combines their artwork with small transparent captures of the titles and labels. If artwork validation repeatedly fails, check the source illustration before retrying; preserve custom artwork and do not delete the previous frame. Desktop and container tests do not replace a capture check on the frame Pi.
 
 BirdWeather mode renders on the Pi from this repo's illustrations on GitHub, so there is no image set to copy over. In ZIP mode, postal codes with no station nearby fall back to the closest ones. If you are far from any BirdWeather station, add `--ebird-key <key>` (a free key from [ebird.org/api/keygen](https://ebird.org/api/keygen)) and the frame fills from eBird sightings instead. Exact station mode has no geographic or eBird fallback.
 

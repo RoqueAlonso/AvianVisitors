@@ -30,12 +30,12 @@ cp /source/scripts/update_birdnet.sh /usr/local/sbin/avian-update-control
 cat >/usr/local/sbin/avian-service-refresh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-[ ! -e /tmp/avian-update-smoke/refresh.fail ] || exit 23
+[ "${1:-}" != --apply-prepared ] || [ ! -e /tmp/avian-update-smoke/refresh.fail ] || exit 23
 [ "${AVIAN_UPDATE_LOCK_FD:-}" = 9 ] || exit 24
 [ -e /proc/self/fd/9 ] || exit 25
 [ "$(readlink -f /proc/self/fd/9)" = /run/lock/avian-update.lock ] || exit 26
 flock -n 9 || exit 27
-touch /tmp/avian-update-smoke/refresh.called
+[ "${1:-}" != --apply-prepared ] || touch /tmp/avian-update-smoke/refresh.called
 EOF
 chown root:root /usr/local/sbin/avian-update-control /usr/local/sbin/avian-service-refresh
 chmod 0755 /usr/local/sbin/avian-update-control /usr/local/sbin/avian-service-refresh

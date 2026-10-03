@@ -145,6 +145,177 @@ chmod 0755 \
   /usr/local/bin/mktemp
 
 previous_refresh=/source/tests/testdata/reinstall_services_16c7217d.sh
+if [ "${1:-}" = --upgrade-recovery ] || [ "${1:-}" = --old-helper-recovery ] \
+  || [ "${1:-}" = --old-helper-completion ]; then
+  station_git() { runuser -u "$station_user" -- git -C "$repo" "$@"; }
+  baseline=$(station_git rev-parse HEAD)
+  cp /source/scripts/update_birdnet.sh "$repo/scripts/update_birdnet.sh"
+  cp /source/scripts/bootstrap_v1.sh "$repo/scripts/bootstrap_v1.sh"
+  cp /source/scripts/update_birdnet_snippets.sh "$repo/scripts/update_birdnet_snippets.sh"
+  touch "$repo/avian/frontend/fonts/.keep" "$repo/avian/frontend/assets/.keep"
+  mkdir -p "$repo/avian/assets/illustrations"
+  printf 'release\n' >"$repo/release.txt"
+  chown -R "$station_user:$station_user" "$repo"
+  station_git add .
+  station_git commit -qm 'selected release'
+  target=$(station_git rev-parse HEAD)
+  git -c safe.directory="$repo" -C "$repo" push -q "$official_remote" avian-visitors
+  station_git reset --hard "$baseline" >/dev/null
+  printf 'custom art\n' >"$repo/avian/assets/illustrations/custom-bird.png"
+  printf '{"custom-bird":{}}\n' >"$repo/avian/frontend/masks.json"
+  printf '{"custom-bird":[1,1]}\n' >"$repo/avian/frontend/dims.json"
+  chown -R "$station_user:$station_user" "$repo"
+  original_art=$test_root/original-art
+  cp "$repo/avian/assets/illustrations/custom-bird.png" "$original_art"
+  install -d -o root -g root -m 0755 /var/lib/avian-visitors
+  printf 'v1\t1\t27\t%s\n' '$2y$14$FJs8skDlFXw6UEyzPutTQuQBPcFdy0iyGDrL3silEC/X6CwX7aOhi' >/var/lib/avian-visitors/admin-auth.state
+  chown root:caddy /var/lib/avian-visitors/admin-auth.state
+  chmod 0640 /var/lib/avian-visitors/admin-auth.state
+  original_auth=$test_root/original-auth
+  cp /var/lib/avian-visitors/admin-auth.state "$original_auth"
+  mv /var/lib/avian-visitors/admin-auth.state "$test_root/auth.saved"
+  php -r '$_SERVER["REMOTE_ADDR"]="203.0.113.8"; require "/source/avian/api/menu.php";' >"$test_root/menu.json"
+  php -r '$j=json_decode(file_get_contents($argv[1]),true); exit(($j["installation_recovery"]??false) === true && empty($j["items"]) ? 0 : 1);' "$test_root/menu.json" || fail 'missing helper did not identify installation recovery'
+  mv "$test_root/auth.saved" /var/lib/avian-visitors/admin-auth.state
+  install -m 0755 /source/scripts/update_birdnet.sh /usr/local/sbin/avian-update-control
+  install -m 0755 /source/scripts/reinstall_services.sh /usr/local/sbin/avian-service-refresh
+  cat >/usr/local/bin/git <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" = *avian-service-refresh.* ]] && [[ " $* " = *' fetch '* ]] && [ -e /tmp/fail-refresh ]; then
+  echo 'Simulated verification fetch failure' >&2
+  exit 71
+fi
+exec /usr/bin/git "$@"
+EOF
+  chmod 0755 /usr/local/bin/git
+  if [ "$1" = --old-helper-completion ]; then
+    station_git merge --ff-only "$target" >/dev/null
+    install -m 0755 "$previous_refresh" /usr/local/sbin/avian-service-refresh
+    /usr/local/sbin/avian-service-refresh >"$test_root/refresh.log" 2>&1 \
+      || fail 'historical helper refresh failed'
+    cmp "$original_auth" /var/lib/avian-visitors/admin-auth.state \
+      || fail 'historical helper refresh changed credentials'
+    # Advance only the remote, leaving the successfully refreshed station at
+    # its previous release. One normal update must select the new release.
+    next_repo=$test_root/next-release
+    git clone -q "$official_remote" "$next_repo"
+    printf '\n# next release\n' >>"$next_repo/scripts/admin_control.sh"
+    git -C "$next_repo" add scripts/admin_control.sh
+    git -C "$next_repo" -c user.name='Refresh smoke' -c user.email=refresh@example.test \
+      commit -qm 'release after historical refresh'
+    latest=$(git -C "$next_repo" rev-parse HEAD)
+    git -C "$next_repo" push -q origin avian-visitors
+    /usr/local/sbin/avian-update-control >"$test_root/refresh.log" 2>&1 \
+      || fail 'update after historical refresh failed'
+    [ "$(station_git rev-parse HEAD)" = "$latest" ] \
+      || fail 'one update after historical refresh did not reach latest release'
+    cmp "$next_repo/scripts/admin_control.sh" /usr/local/sbin/avian-admin-control \
+      || fail 'update after historical refresh installed stale helpers'
+    cmp "$original_auth" /var/lib/avian-visitors/admin-auth.state \
+      || fail 'update after historical refresh changed credentials'
+    cmp "$original_art" "$repo/avian/assets/illustrations/custom-bird.png" \
+      || fail 'update after historical refresh changed art'
+    [ ! -e /var/lib/avian-update-prepared ] \
+      || fail 'completed update retained pending application'
+    echo 'PASS: one update after historical refresh reaches latest release'
+    exit 0
+  fi
+  touch /tmp/fail-refresh
+  if [ "$1" = --old-helper-recovery ]; then
+    install -m 0755 "$previous_refresh" /usr/local/sbin/avian-service-refresh
+    git -c safe.directory=/source -C /source show 265d7e7f8e901ca7ae168ad5f6a84a9b2b6107d4:scripts/update_birdnet.sh >/usr/local/sbin/avian-update-control
+    if /usr/local/sbin/avian-update-control >"$test_root/refresh.log" 2>&1; then fail 'old helper failure reported success'; fi
+    [ "$(station_git rev-parse HEAD)" = "$target" ] || fail 'old updater fixture did not reproduce advanced checkout'
+    [ ! -e /usr/local/sbin/avian-admin-control ] || fail 'old helper fixture unexpectedly installed admin helper'
+    ! grep -q 'AvianVisitors update complete' "$test_root/refresh.log" || fail 'old helper failure printed success'
+    # The documented bootstrap uses its own verified snapshot, not the failing
+    # old refresher fetch. Leave the injected refresher failure in place.
+    bash /source/scripts/bootstrap_v1.sh >"$test_root/refresh.log" 2>&1 || fail 'verified bootstrap did not recover old helper failure'
+    cmp "$original_auth" /var/lib/avian-visitors/admin-auth.state || fail 'old-helper recovery changed credentials'
+    cmp "$original_art" "$repo/avian/assets/illustrations/custom-bird.png" || fail 'old-helper recovery changed art'
+    [ "$(stat -c '%u:%g:%a' /usr/local/sbin/avian-admin-control)" = 0:0:755 ] || fail 'old-helper recovery did not install safe admin helper'
+    echo 'PASS: installed old helper failure recovered through verified bootstrap'
+    exit 0
+  fi
+  if /usr/local/sbin/avian-update-control >"$test_root/refresh.log" 2>&1; then fail 'verification failure reported success'; fi
+  [ "$(station_git rev-parse HEAD)" = "$baseline" ] || fail 'verification failure advanced checkout'
+  cmp "$original_art" "$repo/avian/assets/illustrations/custom-bird.png" || fail 'verification failure changed art'
+  cmp "$original_auth" /var/lib/avian-visitors/admin-auth.state || fail 'verification failure changed credentials'
+  rm /tmp/fail-refresh
+  if /usr/local/sbin/avian-service-refresh --prepare-update "$baseline" >"$test_root/refresh.log" 2>&1; then fail 'accepted historical release'; fi
+  if /usr/local/sbin/avian-service-refresh --prepare-update aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa >"$test_root/refresh.log" 2>&1; then fail 'accepted forged release'; fi
+  /usr/local/sbin/avian-service-refresh --prepare-update "$target" >"$test_root/refresh.log" 2>&1 || fail 'preparation failed'
+  prepared=/var/lib/avian-update-prepared
+  mv "$prepared" /var/lib/avian-prepared-test
+  ln -s /var/lib/avian-prepared-test "$prepared"
+  if /usr/local/sbin/avian-service-refresh --prepare-update "$target" >"$test_root/refresh.log" 2>&1; then fail 'accepted staging directory symlink'; fi
+  rm "$prepared"
+  mv /var/lib/avian-prepared-test "$prepared"
+  chown "$station_user" "$prepared"
+  if /usr/local/sbin/avian-service-refresh --prepare-update "$target" >"$test_root/refresh.log" 2>&1; then fail 'accepted station-owned staging'; fi
+  chown root "$prepared"
+  mv "$prepared/admin_control.sh" "$prepared/admin_control.saved"
+  ln -s admin_control.saved "$prepared/admin_control.sh"
+  if /usr/local/sbin/avian-service-refresh --prepare-update "$target" >"$test_root/refresh.log" 2>&1; then fail 'accepted staging symlink'; fi
+  rm "$prepared/admin_control.sh"
+  mv "$prepared/admin_control.saved" "$prepared/admin_control.sh"
+  printf '\n# tampered\n' >>"$prepared/admin_control.sh"
+  if /usr/local/sbin/avian-service-refresh --prepare-update "$target" >"$test_root/refresh.log" 2>&1; then fail 'accepted manifest mismatch'; fi
+  git -C "$official_remote" show "$target:scripts/admin_control.sh" >"$prepared/admin_control.sh"
+  [ "$(station_git rev-parse HEAD)" = "$baseline" ] || fail 'preparation changed checkout'
+  prepared_admin_helper=$test_root/prepared-admin
+  git -C "$official_remote" show "$target:scripts/admin_control.sh" >"$prepared_admin_helper"
+  # Advance the official branch after preparation, changing actual helper bytes.
+  station_git stash -qu --include-untracked
+  station_git merge --ff-only "$target" >/dev/null
+  printf '\n# next release\n' >>"$repo/scripts/admin_control.sh"
+  station_git add scripts/admin_control.sh
+  station_git commit -qm 'later release'
+  git -c safe.directory="$repo" -C "$repo" push -q "$official_remote" avian-visitors
+  station_git reset --hard "$target" >/dev/null
+  station_git stash pop -q
+  touch /tmp/fail-refresh
+  # Interrupt helper installation, then security application. Both retain recovery.
+  cat >/usr/local/bin/install <<'EOF'
+#!/usr/bin/env bash
+if [[ "$*" = *avian-admin-control* ]] && [ -e /tmp/fail-install ]; then exit 73; fi
+exec /usr/bin/install "$@"
+EOF
+  chmod 0755 /usr/local/bin/install
+  touch /tmp/fail-install
+  if /usr/local/sbin/avian-service-refresh --apply-prepared "$target" >"$test_root/refresh.log" 2>&1; then fail 'interrupted install reported success'; fi
+  ! grep -q 'service refresh complete' "$test_root/refresh.log" || fail 'interrupted install printed success'
+  rm /tmp/fail-install
+  /usr/local/sbin/avian-service-refresh --helper-bootstrap >"$test_root/refresh.log" 2>&1 \
+    || fail 'helper bootstrap could not complete interrupted helper installation'
+  [ "$(cat "$prepared/release")" = "$target" ] && [ "$(cat "$prepared/phase")" = applying ] \
+    || fail 'helper bootstrap discarded pending full application'
+  mv /usr/local/bin/systemctl /usr/local/bin/systemctl.saved 2>/dev/null || true
+  cat >/usr/local/bin/systemctl <<'EOF'
+#!/usr/bin/env bash
+if [ -e /tmp/fail-security ]; then exit 74; fi
+exec /usr/bin/systemctl "$@"
+EOF
+  chmod 0755 /usr/local/bin/systemctl
+  touch /tmp/fail-security
+  if /usr/local/sbin/avian-service-refresh >"$test_root/refresh.log" 2>&1; then fail 'interrupted security reported success'; fi
+  ! grep -q 'service refresh complete' "$test_root/refresh.log" || fail 'interrupted security printed success'
+  cmp "$original_auth" /var/lib/avian-visitors/admin-auth.state || fail 'interruption changed credentials'
+  rm /tmp/fail-security
+  /usr/local/sbin/avian-service-refresh >"$test_root/refresh.log" 2>&1 || fail 'offline resume failed'
+  [ "$(station_git rev-parse HEAD)" = "$target" ] || fail 'resume changed selected release'
+  cmp "$prepared_admin_helper" /usr/local/sbin/avian-admin-control || fail 'installed different release helper'
+  cmp "$original_auth" /var/lib/avian-visitors/admin-auth.state || fail 'resume changed credentials'
+  cmp "$original_art" "$repo/avian/assets/illustrations/custom-bird.png" || fail 'resume changed art'
+  mv /var/lib/avian-visitors/admin-auth.state "$test_root/auth.saved"
+  php -r '$_SERVER["REMOTE_ADDR"]="203.0.113.8"; require "/source/avian/api/menu.php";' >"$test_root/menu.json"
+  php -r '$j=json_decode(file_get_contents($argv[1]),true); exit(($j["recovery"]??false) === true && ($j["installation_recovery"]??true) === false && empty($j["items"]) ? 0 : 1);' "$test_root/menu.json" || fail 'healthy helper did not retain password recovery'
+  chmod 0777 /usr/local/sbin/avian-admin-control
+  php -r '$_SERVER["REMOTE_ADDR"]="203.0.113.8"; require "/source/avian/api/menu.php";' >"$test_root/menu.json"
+  php -r '$j=json_decode(file_get_contents($argv[1]),true); exit(($j["installation_recovery"]??false) === true && empty($j["items"]) ? 0 : 1);' "$test_root/menu.json" || fail 'unsafe helper did not lock menu with installation recovery'
+  echo 'PASS: upgrade preparation and offline recovery'
+  exit 0
+fi
 [ "$(sha256sum "$previous_refresh" | cut -d' ' -f1)" = \
   6ac215542c525e99b9315ff704eff05218999f3ec4adf015c9bc7c7d8caba9c5 ] \
   || fail 'previous release helper fixture does not match public commit 16c7217d'
@@ -468,7 +639,7 @@ as_station git -C "$repo" update-ref refs/remotes/origin/avian-visitors HEAD
 if /usr/local/sbin/avian-service-refresh >"$test_root/forged.log" 2>&1; then
   fail 'station-owned commit was accepted as official helper code'
 fi
-grep -q 'checkout is not the current official' "$test_root/forged.log" \
+grep -Eq 'checkout is not the current official|prepared release does not match checkout' "$test_root/forged.log" \
   || fail 'unverified checkout failure was unclear'
 [ "$(sha256sum /usr/local/sbin/avian-maintenance-control | cut -d' ' -f1)" = "$installed_hash" ] \
   || fail 'station-owned commit replaced the installed helper'

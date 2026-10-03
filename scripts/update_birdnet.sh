@@ -252,6 +252,19 @@ case "$original_branch" in
 esac
 original_head=$(git_station rev-parse --verify HEAD)
 target_commit=$(git_station rev-parse --verify "$target_ref^{commit}")
+prepared_dir=/var/lib/avian-update-prepared
+if [ -e "$prepared_dir" ] || [ -L "$prepared_dir" ]; then
+  [ -d "$prepared_dir" ] && [ ! -L "$prepared_dir" ] \
+    && [ "$(stat -c '%u:%g:%a' "$prepared_dir")" = 0:0:700 ] \
+    && [ -f "$prepared_dir/release" ] && [ ! -L "$prepared_dir/release" ] \
+    && [ "$(stat -c '%u:%g:%a:%h' "$prepared_dir/release")" = 0:0:600:1 ] \
+    || die 'prepared release is unsafe; repair verified update setup'
+  target_commit=$(cat "$prepared_dir/release")
+  [[ "$target_commit" =~ ^[0-9a-f]{40}$ ]] || die 'prepared release identity is invalid'
+  git_station cat-file -e "$target_commit^{commit}" \
+    || die 'prepared release is unavailable in checkout; retry verified update setup'
+fi
+target_ref=$target_commit
 original_release_head=''
 if git_station show-ref --verify --quiet "refs/heads/$RELEASE_BRANCH"; then
   original_release_head=$(git_station rev-parse --verify "refs/heads/$RELEASE_BRANCH^{commit}")
@@ -549,6 +562,7 @@ if [ "${#custom_illustrations[@]}" -gt 0 ]; then
 fi
 
 generated_paths=("${tracked_generated_paths[@]}" "${untracked_generated_paths[@]}")
+AVIAN_UPDATE_LOCK_FD=9 "$REFRESH_HELPER" --prepare-update "$target_commit"
 if [ "${#generated_paths[@]}" -gt 0 ]; then
   archive_paths generated "${generated_paths[@]}"
   generated_archive=$last_archive
@@ -588,7 +602,7 @@ if [ "$original_branch" = "$RELEASE_BRANCH" ]; then
     || die "local $RELEASE_BRANCH has commits not present on origin"
   if [ "$original_head" != "$target_commit" ]; then
     transaction_started=true
-    git_station merge --ff-only "$target_ref"
+    git_station merge --ff-only "$target_commit"
   fi
 else
   # A legacy main checkout can migrate without deleting unrelated local files.
@@ -609,7 +623,7 @@ else
     git_station switch --create "$RELEASE_BRANCH"
     legacy_branch_created=true
   fi
-  git_station merge --ff-only "$target_ref"
+  git_station merge --ff-only "$target_commit"
 fi
 
 # Depth-limited legacy clones normally fetch only main. Replace every inherited
@@ -644,6 +658,8 @@ fi
 
 safe_root_helper "$REFRESH_HELPER" \
   || die "root-owned service refresher is missing or unsafe: $REFRESH_HELPER"
-AVIAN_UPDATE_LOCK_FD=9 "$REFRESH_HELPER"
+if ! AVIAN_UPDATE_LOCK_FD=9 "$REFRESH_HELPER" --apply-prepared "$target_commit"; then
+  die 'installation did not finish; run sudo /usr/local/sbin/avian-service-refresh to resume'
+fi
 
 echo 'AvianVisitors update complete.'
